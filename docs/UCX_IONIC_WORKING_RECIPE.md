@@ -57,43 +57,42 @@ Why each is needed:
   `libibverbs` cannot find a usable device even with the character devices
   present.
 
-## 3. Script-level bug fixed (our own test harness, not a NIXL bug)
+## 3. Working, verified scripts
 
-Our test scripts (`run_sameNode_loopback_ucx.sh`, `run_crossNode_ucx.sh`,
-`ucx_xnode_worker.sh`, all under
-`/data/avpaul/disagg_logs/nixlbench_vram/`) had `--check_consistency`
-defined as a variable but never actually passed it to the nixlbench
-binary -- so earlier "passing" runs were not actually byte-verified.
+The actual corrected scripts (not just a description) are checked in
+under [`docs/scripts/`](scripts/):
 
-Fixed by:
-- Adding `CHECK_CONSISTENCY=${CHECK_CONSISTENCY:-0}` to each script.
-- Adding `--check_consistency "$CHECK_CONSISTENCY"` to the real nixlbench
-  invocation.
-- Threading `$CHECK_CONSISTENCY` through as an explicit positional arg
-  between the driver scripts and `ucx_xnode_worker.sh`.
+- [`run_crossNode_ucx.sh`](scripts/run_crossNode_ucx.sh) -- cross-node
+  driver (2 real nodes).
+- [`run_sameNode_loopback_ucx.sh`](scripts/run_sameNode_loopback_ucx.sh)
+  -- same-node loopback driver.
+- [`ucx_xnode_worker.sh`](scripts/ucx_xnode_worker.sh) -- per-node worker
+  invoked by both drivers; this is where env vars (section 1) and Docker
+  flags (section 2) are actually applied, and where
+  `--check_consistency "$CHECK_CONSISTENCY"` is correctly passed through
+  to the real `nixlbench` binary (an earlier version of this script
+  defined the variable but never passed it to the binary, so earlier
+  "passing" runs weren't actually byte-verified -- that gap is fixed in
+  the version checked in here).
 
 ## 4. Known-good invocation (full 4KB->1GiB sweep, cross-node)
 
 ```bash
-cd /data/avpaul/disagg_logs/nixlbench_vram
-sbatch --export=ALL,CHECK_CONSISTENCY=1 run_crossNode_ucx.sh
+sbatch --export=ALL,CHECK_CONSISTENCY=1 docs/scripts/run_crossNode_ucx.sh
 ```
 
 Defaults already in the script: `START_BLOCK_SIZE=4096`,
 `MAX_BLOCK_SIZE=1073741824` (1GiB), `NUM_ITER=64`, `WARMUP_ITER=16`,
 `UCX_TLS_OVERRIDE=rc_verbs,tcp,self`. Override via
-`--export=ALL,VAR=value,...` as needed.
+`--export=ALL,VAR=value,...` as needed. Adjust `HOST_PREFIX`, node names,
+and image inside the script for your own cluster.
 
-Result reference: `UCX_PLUGIN_CROSSNODE_VERDICT_12016.txt` and
-`ucx_xnode_12016_target.log` under
-`/data/avpaul/disagg_logs/nixlbench_vram/` -- full 19-row table, 51.1 GB/s
-plateau at 1GiB, zero consistency mismatches.
+Verified result: full 19-row table (4KB->1GiB), 51.1 GB/s plateau at
+1GiB, zero consistency mismatches at every size.
 
 ## 5. Scope notes
 
-- None of items 1-2 required any change to NIXL's own source code
+- None of items 1-3 required any change to NIXL's own source code
   (`git diff --stat` against upstream `main` shows zero changes under
-  `src/plugins/ucx/`). This doc is kept in our own fork for internal reuse,
-  not submitted upstream.
-- Item 3 is a bug in our own private scripts, outside the NIXL repo
-  entirely.
+  `src/plugins/ucx/`). This doc and the scripts in `docs/scripts/` are
+  kept in our own fork for internal reuse, not submitted upstream.
