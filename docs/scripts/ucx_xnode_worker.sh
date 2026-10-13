@@ -1,20 +1,53 @@
 #!/bin/bash
-# Per-node worker for run_crossNode_ucx.sh. Mirrors mori_io_xnode_worker.sh.
+# Per-node worker for run_crossNode_ucx.sh. One invocation runs on each of
+# the two physical nodes (TARGET and INIT roles).
+#
+# TARGET resolves its own fabric IP and picks its own free local port (it is
+# already running on the target node, so no extra srun step is needed to do
+# this), then writes "IP:PORT" to the shared NFS port file. INIT polls that
+# file and reads it. Passing the resolved value through a file instead of a
+# positional argument avoids value corruption observed when passing it
+# through srun -> bash -> docker as a bare argument.
 set -euo pipefail
 TAG=${1:?}
-ASIO_TARGET_IP=${2:?}
-ASIO_PORT=${3:?}
-HOST_PREFIX=${4:?}
-IMAGE=${5:?}
-INIT_SEG=${6:?}
-TGT_SEG=${7:?}
-TOTAL_BUF=${8:?}
-START_BLOCK=${9:?}
-MAX_BLOCK=${10:?}
-NUM_ITER=${11:?}
-WARMUP=${12:?}
-UCX_TLS=${13:?}
-CHECK_CONSISTENCY=${14:-0}
+PORT_FILE=${2:?}
+HOST_PREFIX=${3:?}
+IMAGE=${4:?}
+INIT_SEG=${5:?}
+TGT_SEG=${6:?}
+TOTAL_BUF=${7:?}
+START_BLOCK=${8:?}
+MAX_BLOCK=${9:?}
+NUM_ITER=${10:?}
+WARMUP=${11:?}
+UCX_TLS=${12:?}
+CHECK_CONSISTENCY=${13:-0}
+
+if [[ "$TAG" == TARGET* ]]; then
+  ASIO_TARGET_IP=$(hostname -I | tr ' ' '\n' | grep -E '^192\.168\.50\.' | head -1)
+  [[ -n "$ASIO_TARGET_IP" ]] || { echo "FATAL[$TAG]: could not resolve own fabric IP"; exit 2; }
+  ASIO_PORT=""
+  for _ in $(seq 1 20); do
+    candidate=$((40000 + RANDOM % 20000))
+    if ! ss -tln 2>/dev/null | awk -v p=":$candidate\$" '$4 ~ p' | grep -q .; then
+      ASIO_PORT=$candidate
+      break
+    fi
+  done
+  [[ -n "$ASIO_PORT" ]] || { echo "FATAL[$TAG]: could not find a free local port"; exit 2; }
+  echo "${ASIO_TARGET_IP}:${ASIO_PORT}" > "$PORT_FILE"
+  echo "[$TAG] resolved own IP=$ASIO_TARGET_IP, picked free port=$ASIO_PORT, wrote $PORT_FILE"
+else
+  for _ in $(seq 1 40); do
+    [[ -s "$PORT_FILE" ]] && break
+    sleep 0.5
+  done
+  IPPORT=$(cat "$PORT_FILE" 2>/dev/null)
+  [[ -n "$IPPORT" ]] || { echo "FATAL[$TAG]: could not read IP:PORT from $PORT_FILE"; exit 2; }
+  ASIO_TARGET_IP=${IPPORT%%:*}
+  ASIO_PORT=${IPPORT##*:}
+fi
+[[ -n "${ASIO_PORT:-}" && -n "${ASIO_TARGET_IP:-}" ]] || { echo "FATAL[$TAG]: empty IP/port"; exit 2; }
 
 IBDEV_ARGS=()
 [[ -c /dev/infiniband/rdma_cm ]] && IBDEV_ARGS+=(--device /dev/infiniband/rdma_cm)
@@ -37,10 +70,10 @@ docker run --rm \
   -e UCX_TLS="${UCX_TLS}" \
   -e UCX_NET_DEVICES=ionic_0:1,lo \
   -e UCX_IB_GID_INDEX=1 \
+  -e UCX_UD_VERBS_ETH_DGID_CHECK=n \
   --entrypoint bash "${IMAGE}" -lc '
     export PATH=/prefix/bin:$PATH
     export LD_LIBRARY_PATH=/prefix/lib:/prefix/lib/x86_64-linux-gnu:/prefix/lib/ucx:/opt/rocm/lib:/opt/rocm/lib64
-    echo "['"$TAG"'] NIXL_PLUGIN_DIR default (UCX builtin)"
     exec nixlbench --runtime_type ASIO --asio_address '"$ASIO_TARGET_IP"' --asio_port '"$ASIO_PORT"' \
       --backend UCX \
       --initiator_seg_type "'"$INIT_SEG"'" --target_seg_type "'"$TGT_SEG"'" \
