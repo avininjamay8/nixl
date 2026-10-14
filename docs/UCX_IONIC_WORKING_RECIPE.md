@@ -151,7 +151,10 @@ Root cause: NIXL defaults to `UCP_ERR_HANDLING_MODE_PEER`. UCX 1.18.1
 `get/bcopy`. GET falls back to `get/am/bcopy` (emulated), whose AM sends
 exhaust the nosrq RQ and cause RNR retries. PUT protocols carry the flag, so
 WRITE stays `put/offload/zcopy`. `ucx_error_handling_mode=none` restores
-fast GET but failed the data check, so don't use it.
+fast GET but failed the data check, so don't use it. UCX ≥ 1.19 adds the
+flag to `get/zcopy` and `get/bcopy` (openucx/ucx `ba542c0dc`, PR #10576), so
+the stock `NixlConnector` (READ) needs the nosrq patch on ≥ 1.19, or that
+commit backported to 1.18.1.
 
 ### Settings (on top of Sections 1–2)
 
@@ -169,6 +172,10 @@ fast GET but failed the data check, so don't use it.
 Run inside the container from Section 2, with the env above.
 
 ```bash
+# each node: NIXL handshake address (default is localhost, which breaks cross-node)
+export VLLM_NIXL_SIDE_CHANNEL_HOST=<this node's IP>
+export VLLM_NIXL_SIDE_CHANNEL_PORT=5600
+
 # prefill node
 vllm serve /models/DeepSeek-V3 --host <P_IP> --port 8100 \
   --tensor-parallel-size 8 --trust-remote-code \
