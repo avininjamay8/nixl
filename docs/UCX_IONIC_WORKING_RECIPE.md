@@ -166,27 +166,115 @@ WRITE stays `put/offload/zcopy`. `ucx_error_handling_mode=none` restores
 
 ### Commands
 
-Run inside the container from Section 2, with the env above.
+Image `vllm/vllm-openai-rocm:nightly` (vLLM 0.32.0rc1.dev100+g77154ca61),
+router image `vllm/vllm-router:nightly`. Placeholders:
+
+- `NIXL_PREFIX`: NIXL + UCX 1.18.1 install built with the nosrq patch
+- `NIXL_PY`: NIXL Python bindings built against it, with the per-rank rail
+  hook in `nixl_agent.__init__` (sets `UCX_NET_DEVICES=ionic_<gpu>:1,lo`)
+- `P_IP` / `D_IP`: prefill / decode node IPs; `MODELS`: model directory
+
+**1. Container (prefill node; on the decode node use `NODE_IP=$D_IP`)**
 
 ```bash
-# each node: NIXL handshake address (default is localhost, which breaks cross-node)
-export VLLM_NIXL_SIDE_CHANNEL_HOST=<this node's IP>
-export VLLM_NIXL_SIDE_CHANNEL_PORT=5600
+export NIXL_PREFIX=/path/to/nixl-prefix-nosrq
+export NIXL_PY=/path/to/nixl-python-rail
+export MODELS=/data/models2
+export NODE_IP=$P_IP
 
-# prefill node
-vllm serve /models/DeepSeek-V3 --host <P_IP> --port 8100 \
-  --tensor-parallel-size 8 --trust-remote-code \
-  --kv-cache-dtype fp8 --max-model-len 32768 --gpu-memory-utilization 0.85 \
-  --kv-transfer-config '{"kv_connector":"NixlPushConnector","kv_role":"kv_producer","kv_buffer_device":"cuda","kv_connector_extra_config":{"backends":["UCX"]}}'
-
-# decode node: same, except
-#   --host <D_IP> --port 8200 and "kv_role":"kv_consumer"
-
-# router (either node)
-vllm-router --vllm-pd-disaggregation --kv-connector nixl \
-  --prefill http://<P_IP>:8100 --decode http://<D_IP>:8200 \
-  --host 0.0.0.0 --port 30000 --policy round_robin
+docker run --rm -it \
+  --device /dev/dri --device /dev/kfd --device /dev/infiniband \
+  --network host --ipc host \
+  --group-add "$(getent group video | cut -d: -f3)" \
+  --group-add "$(getent group render | cut -d: -f3)" \
+  --cap-add SYS_PTRACE --cap-add IPC_LOCK \
+  --security-opt seccomp=unconfined \
+  --shm-size 64G \
+  --ulimit nofile=1048576:1048576 --ulimit memlock=-1:-1 \
+  -v "$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1)":/usr/lib/x86_64-linux-gnu/libionic.so.1:ro \
+  -v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro \
+  -v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro \
+  -v "$NIXL_PREFIX":/nixl-prefix:ro \
+  -v "$NIXL_PREFIX":/prefix:ro \
+  -v "$NIXL_PY":/nixlpy:ro \
+  -v "$MODELS":/models:ro \
+  -e UCX_TLS=rc_verbs,ud_verbs,tcp,self,rocm_copy \
+  -e UCX_NET_DEVICES=ionic_0:1,lo \
+  -e UCX_IB_GID_INDEX=1 \
+  -e UCX_UD_VERBS_ETH_DGID_CHECK=n \
+  -e UCX_IB_GPU_DIRECT_RDMA=yes \
+  -e UCX_RNDV_SCHEME=get_zcopy \
+  -e UCX_MODULE_DIR=/nixl-prefix/lib/ucx \
+  -e UCX_RCACHE_MAX_UNRELEASED=1024 \
+  -e UCX_ROCM_COPY_SIGPOOL_MAX_ELEMS=inf \
+  -e UCX_WARN_UNUSED_ENV_VARS=n \
+  -e UCX_LOG_LEVEL=info \
+  -e PYTHONPATH=/nixlpy \
+  -e LD_LIBRARY_PATH=/nixl-prefix/lib/x86_64-linux-gnu:/nixl-prefix/lib:/nixl-prefix/lib/ucx \
+  -e VLLM_NIXL_SIDE_CHANNEL_HOST="$NODE_IP" \
+  -e VLLM_NIXL_SIDE_CHANNEL_PORT=5600 \
+  vllm/vllm-openai-rocm:nightly bash
 ```
+
+`UCX_NET_DEVICES=ionic_0:1,lo` is only the fallback; each rank overrides it
+with its own rail. `VLLM_NIXL_SIDE_CHANNEL_HOST` must be the node's own IP
+(the default is localhost, which breaks cross-node handshakes).
+
+**2. Prefill server (inside the prefill container)**
+
+```bash
+vllm serve /models/DeepSeek-V3 \
+  --host "$P_IP" --port 8100 \
+  --tensor-parallel-size 8 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.85 \
+  --kv-transfer-config '{"kv_connector":"NixlPushConnector","kv_role":"kv_producer","kv_buffer_device":"cuda","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"backends":["UCX"],"kv_lease_duration":180}}'
+```
+
+**3. Decode server (inside the decode container)**
+
+```bash
+vllm serve /models/DeepSeek-V3 \
+  --host "$D_IP" --port 8200 \
+  --tensor-parallel-size 8 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.85 \
+  --kv-transfer-config '{"kv_connector":"NixlPushConnector","kv_role":"kv_consumer","kv_buffer_device":"cuda","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"backends":["UCX"],"kv_lease_duration":180}}'
+```
+
+**4. Router (prefill node, after both servers report healthy)**
+
+```bash
+docker run -d --name vllm-router --network host \
+  vllm/vllm-router:nightly \
+  vllm-router --vllm-pd-disaggregation --kv-connector nixl \
+    --prefill "http://$P_IP:8100" \
+    --decode "http://$D_IP:8200" \
+    --worker-startup-timeout-secs 1800 \
+    --host 0.0.0.0 --port 30000 \
+    --intra-node-data-parallel-size 1 \
+    --policy round_robin --prefill-policy round_robin --decode-policy round_robin \
+    --log-level info
+```
+
+**5. Accuracy check (any node)**
+
+```bash
+lm_eval --model local-completions --tasks gsm8k --num_fewshot 5 --limit 50 \
+  --model_args "model=/models/DeepSeek-V3,base_url=http://$P_IP:30000/v1/completions,num_concurrent=1,max_retries=3,tokenized_requests=False,timeout=7200" \
+  --gen_kwargs max_gen_toks=512
+```
+
+Router flags: static `--prefill/--decode` URLs, because NIXL workers do not
+register through router discovery. `kv_lease_duration=180` keeps prefill from
+releasing (and tearing down the endpoint for) blocks that decode has not
+fetched yet at `num_concurrent=1`; the 30 s default triggers the
+`ud_ep.c:285` abort below. `kv_load_failure_policy=recompute` retries a failed
+load instead of failing the request.
 
 Known issue: the `ud_verbs` keepalive can still abort at `ud_ep.c:285`
 (assertions are compiled in).
