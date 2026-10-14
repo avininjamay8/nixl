@@ -130,55 +130,35 @@ Defaults already in the script: `START_BLOCK_SIZE=4096`,
 - Sections 1–4 cover **WRITE** mode only. Section 6 explains why READ is
   slow on this stack and what vLLM disaggregated serving uses instead.
 
-## 6. vLLM disaggregated serving (NIXL KV connector)
+## 6. vLLM disaggregated serving
 
-**Verified result:** DeepSeek-V3 TP8 1P1D across 2 nodes, KV cache
-VRAM-to-VRAM over `rc_verbs`, gsm8k (limit 50) **0.94**. All 400 transfers
-(50 requests × 8 TP ranks) succeeded, 0 failed, no recompute fallback;
-~1.2 ms per ~35 MB transfer, ~28–31 GB/s per rank (SLURM job 12880).
+Result: DeepSeek-V3 TP8 1P1D, VRAM→VRAM over `rc_verbs`, gsm8k 0.94,
+400/400 KV transfers OK, ~30 GB/s per rank (job 12880).
 
-### READ vs WRITE in vLLM
+### Use WRITE, not READ
 
-| vLLM connector | NIXL op | UCX call | Protocol selected (default NIXL settings) |
+| Connector | Op | UCX protocol | BW |
 |---|---|---|---|
-| `NixlConnector` / `NixlPullConnector` (decode pulls) | `READ` | `ucp_get_nbx` | `get/am/bcopy`: emulated, **~0.7 GB/s** |
-| `NixlPushConnector` (prefill pushes) | `WRITE` | `ucp_put_nbx` | `put/offload/zcopy`: RDMA WRITE, **~30–48 GB/s** |
+| `NixlConnector` (= `NixlPullConnector`) | READ | `get/am/bcopy` (emulated) | ~0.7 GB/s, hangs under load |
+| `NixlPushConnector` | WRITE | `put/offload/zcopy` | ~30–48 GB/s |
 
-Root cause of the slow READ: the NIXL UCX backend defaults to
-`UCP_ERR_HANDLING_MODE_PEER` (`src/plugins/ucx/ucx_backend.cpp`, backend
-param `ucx_error_handling_mode`). In UCX 1.18.1, `proto_multi.c` rejects any
-protocol that doesn't declare `UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING` when
-error handling is enabled. `get/zcopy` and `get/bcopy` (`rma/get_offload.c`)
-don't declare it, so the only GET left is `get/am/bcopy` (`rma/get_am.c`).
-That isn't an RDMA READ: it sends active messages that consume the
-receiver's preposted RQ buffers on the nosrq build, causing RNR retries and
-hangs under vLLM load. All `put/offload/*` protocols do declare the flag, so
-WRITE stays zero-copy. vLLM doesn't expose `ucx_error_handling_mode`.
+NIXL defaults to `UCP_ERR_HANDLING_MODE_PEER`. UCX 1.18.1 (`proto_multi.c`)
+then drops protocols without `UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING`,
+which removes `get/zcopy` and `get/bcopy`. The fallback `get/am/bcopy` uses
+AM sends that exhaust the nosrq RQ, causing RNR retries. PUT protocols carry
+the flag. `ucx_error_handling_mode=none` restores fast GET but failed the
+data check, so don't use it.
 
-Setting `ucx_error_handling_mode=none` does select fast GET (47.8 GB/s in a
-standalone NIXL Python probe), but the probe's data check **failed**, so
-it's not a usable fix. Use WRITE.
+### Settings (on top of Sections 1–2)
 
-### Recipe (deltas from Sections 1–2)
-
-| Change | Why |
+| Setting | Why |
 |---|---|
-| `kv_connector=NixlPushConnector`, `kv_buffer_device=cuda` | Uses RDMA WRITE (see above); KV stays in VRAM. Limits: no DCP>1, and prefill/decode KV cache layouts must match. |
-| `UCX_NET_DEVICES=ionic_<gpu>:1,lo`, set per TP rank | GPU *k* sits on the same PCIe switch as `ionic_k`, and the rails are isolated (`ionic_k` reaches only `ionic_k`). One shared device for all 8 ranks puts every rank on one rail. All 8 ranks share one container env, so a patched `nixl_rocm/_api.py` sets it in `nixl_agent.__init__` from `torch.cuda.current_device()`, before UCX initializes. |
-| `UCX_TLS=rc_verbs,ud_verbs,tcp,self,rocm_copy` | Adds `rocm_copy` to Section 1's list. Without it UCX registers VRAM as host memory. |
-| `UCX_IB_GPU_DIRECT_RDMA=yes`, `UCX_RNDV_SCHEME=get_zcopy` | The NIC accesses GPU memory directly, with no host bounce. |
-| `UCX_IB_GID_INDEX=1`, `UCX_UD_VERBS_ETH_DGID_CHECK=n` | Same as Section 1. |
-| Mount the nosrq UCX prefix at both `/nixl-prefix` and `/prefix` | `libnixl` and UCX have `/prefix/...` compiled in for plugin and module discovery. |
-| `LD_LIBRARY_PATH=/nixl-prefix/lib:/nixl-prefix/lib/ucx:…`, `UCX_MODULE_DIR=/nixl-prefix/lib/ucx` | Otherwise the image's bundled UCX 1.22 is loaded, which has no working `rc_verbs` on ionic and falls back to TCP/UD. Check that the log shows `UCX Version 1.18.1 (loaded from /nixl-prefix/lib/libucp.so.0)`. |
-| `PYTHONPATH=/nixlpy` (NIXL Python bindings built against the same prefix) | Keeps the bindings ABI-matched to the mounted `libnixl`/UCX. |
+| `kv_connector=NixlPushConnector`, `kv_buffer_device=cuda` | Uses RDMA WRITE; KV stays in VRAM |
+| `UCX_NET_DEVICES=ionic_<gpu>:1,lo` per rank (set in `nixl_agent.__init__` from `torch.cuda.current_device()`) | GPU k ↔ `ionic_k` share a PCIe switch; rails are isolated |
+| `UCX_TLS=rc_verbs,ud_verbs,tcp,self,rocm_copy` | Without `rocm_copy`, VRAM is registered as host memory |
+| `UCX_IB_GPU_DIRECT_RDMA=yes`, `UCX_RNDV_SCHEME=get_zcopy` | GPU-direct, no host bounce |
+| Mount prefix at `/nixl-prefix` and `/prefix`; `LD_LIBRARY_PATH`, `UCX_MODULE_DIR=/nixl-prefix/lib/ucx` | Otherwise the image's bundled UCX 1.22 loads (no `rc_verbs` on ionic) |
+| `PYTHONPATH=/nixlpy` | Bindings ABI-matched to the mounted `libnixl` |
 
-### Known issues
-
-- `ud_verbs` stays in use as the keepalive lane (`ka(ud_verbs)`). UCX is
-  built with assertions enabled, so an endpoint torn down after an error can
-  abort a worker at `ud_ep.c:285`. Mitigations not yet validated:
-  `UCX_KEEPALIVE_INTERVAL=inf`, or rebuild the prefix with
-  `--disable-assertions`.
-- vLLM's `kv_load_failure_policy=recompute` hides transfer failures behind
-  correct accuracy. Check that successful transfers > 0 in the decode/prefill
-  `KV Transfer metrics` lines before trusting a pass.
+Known issue: the `ud_verbs` keepalive can still abort at `ud_ep.c:285`
+(assertions are compiled in).
