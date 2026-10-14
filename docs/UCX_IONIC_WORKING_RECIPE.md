@@ -133,21 +133,25 @@ Defaults already in the script: `START_BLOCK_SIZE=4096`,
 ## 6. vLLM disaggregated serving
 
 Result: DeepSeek-V3 TP8 1P1D, VRAM→VRAM over `rc_verbs`, gsm8k 0.94,
-400/400 KV transfers OK, ~30 GB/s per rank (job 12880).
+400/400 KV transfers OK.
 
-### Use WRITE, not READ
+### READ vs WRITE (same UCX prefix, env and NIC rails in each pair)
 
-| Connector | Op | UCX protocol | BW |
-|---|---|---|---|
-| `NixlConnector` (= `NixlPullConnector`) | READ | `get/am/bcopy` (emulated) | ~0.7 GB/s, hangs under load |
-| `NixlPushConnector` | WRITE | `put/offload/zcopy` | ~30–48 GB/s |
+| Test | READ | WRITE |
+|---|---|---|
+| nixlbench, VRAM→VRAM, 4 MiB blocks, 1 rail | 0.84 GB/s | 27.8 GB/s |
+| vLLM TP8 KV transfer (~32 MB per rank per request) | ~50 ms, 0.64 GB/s per rank; stalls mid-eval | ~1.2 ms, ~30 GB/s per rank; eval completes |
 
-NIXL defaults to `UCP_ERR_HANDLING_MODE_PEER`. UCX 1.18.1 (`proto_multi.c`)
-then drops protocols without `UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING`,
-which removes `get/zcopy` and `get/bcopy`. The fallback `get/am/bcopy` uses
-AM sends that exhaust the nosrq RQ, causing RNR retries. PUT protocols carry
-the flag. `ucx_error_handling_mode=none` restores fast GET but failed the
-data check, so don't use it.
+vLLM's `NixlConnector` (= `NixlPullConnector`) issues READ (`ucp_get_nbx`);
+`NixlPushConnector` issues WRITE (`ucp_put_nbx`).
+
+Root cause: NIXL defaults to `UCP_ERR_HANDLING_MODE_PEER`. UCX 1.18.1
+(`proto_multi.c`) then drops protocols without
+`UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING`, which removes `get/zcopy` and
+`get/bcopy`. GET falls back to `get/am/bcopy` (emulated), whose AM sends
+exhaust the nosrq RQ and cause RNR retries. PUT protocols carry the flag, so
+WRITE stays `put/offload/zcopy`. `ucx_error_handling_mode=none` restores
+fast GET but failed the data check, so don't use it.
 
 ### Settings (on top of Sections 1–2)
 
@@ -157,8 +161,28 @@ data check, so don't use it.
 | `UCX_NET_DEVICES=ionic_<gpu>:1,lo` per rank (set in `nixl_agent.__init__` from `torch.cuda.current_device()`) | GPU k ↔ `ionic_k` share a PCIe switch; rails are isolated |
 | `UCX_TLS=rc_verbs,ud_verbs,tcp,self,rocm_copy` | Without `rocm_copy`, VRAM is registered as host memory |
 | `UCX_IB_GPU_DIRECT_RDMA=yes`, `UCX_RNDV_SCHEME=get_zcopy` | GPU-direct, no host bounce |
-| Mount prefix at `/nixl-prefix` and `/prefix`; `LD_LIBRARY_PATH`, `UCX_MODULE_DIR=/nixl-prefix/lib/ucx` | Otherwise the image's bundled UCX 1.22 loads (no `rc_verbs` on ionic) |
+| Mount prefix at `/nixl-prefix` and `/prefix`; `LD_LIBRARY_PATH=/nixl-prefix/lib:/nixl-prefix/lib/ucx`, `UCX_MODULE_DIR=/nixl-prefix/lib/ucx` | Otherwise the image's bundled UCX 1.22 loads (no `rc_verbs` on ionic) |
 | `PYTHONPATH=/nixlpy` | Bindings ABI-matched to the mounted `libnixl` |
+
+### Commands
+
+Run inside the container from Section 2, with the env above.
+
+```bash
+# prefill node
+vllm serve /models/DeepSeek-V3 --host <P_IP> --port 8100 \
+  --tensor-parallel-size 8 --trust-remote-code \
+  --kv-cache-dtype fp8 --max-model-len 32768 --gpu-memory-utilization 0.85 \
+  --kv-transfer-config '{"kv_connector":"NixlPushConnector","kv_role":"kv_producer","kv_buffer_device":"cuda","kv_connector_extra_config":{"backends":["UCX"]}}'
+
+# decode node: same, except
+#   --host <D_IP> --port 8200 and "kv_role":"kv_consumer"
+
+# router (either node)
+vllm-router --vllm-pd-disaggregation --kv-connector nixl \
+  --prefill http://<P_IP>:8100 --decode http://<D_IP>:8200 \
+  --host 0.0.0.0 --port 30000 --policy round_robin
+```
 
 Known issue: the `ud_verbs` keepalive can still abort at `ud_ep.c:285`
 (assertions are compiled in).
