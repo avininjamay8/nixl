@@ -1,280 +1,264 @@
-# NIXL + UCX — Working Recipe (internal notes, cluster-specific)
+# NIXL + UCX on ionic
 
-Everything needed to get a real, verified, cross-node NIXL+UCX RDMA
-**WRITE** transfer working over the "ionic" NIC fabric on this cluster.
+Cross-node VRAM-to-VRAM READ and WRITE, on UCX 1.22.0 (current release), over `rc_verbs`. No TCP data path.
 
-**Verified result:** full 19-row sweep (4KB→1GiB), `--check_consistency=1`,
-real second physical node: **48.87 GB/s at 1 GiB** (ramping smoothly from
-0.38 GB/s at 4KB — a normal RDMA bandwidth-vs-message-size curve), **zero
-consistency mismatches** reported for any block size. Confirmed
-independently via `ionic_0` hardware RDMA byte counters
-(`/sys/class/infiniband/ionic_0/ports/1/hw_counters/{rx,tx}_rdma_ucast_bytes`)
-bracketed before/after the run, matching the expected total transferred
-bytes for the sweep.
+Hardware RDMA READ into GPU memory completes and leaves the buffer unchanged. RDMA WRITE into the same GPU registration lands. READ stays a NIXL read: UCX refuses a ROCm GET sink and the peer RDMA-WRITEs into the local GPU buffer.
 
-Known follow-up (does not affect result validity): nixlbench segfaults
-during final process teardown, *after* the full table has already printed.
-The crash backtrace is confined entirely to `nixlbench`/`libstdc++`, never
-`libuct_ib` — a post-completion cleanup bug in nixlbench's own shutdown
-path, not in UCX or the RDMA transfer itself.
-
-## 1. Environment variables (passed to the nixlbench process)
-
-```bash
-UCX_TLS=rc_verbs,ud_verbs,tcp,self   # rc_verbs = RMA data path; ud_verbs = required bootstrap/aux transport; tcp/self = fallback
-UCX_NET_DEVICES=ionic_0:1            # pin to exactly one rail (avoids ambiguous multi-rail selection)
-UCX_IB_GID_INDEX=1                   # correct RoCEv2 GID table entry for this fabric
-UCX_UD_VERBS_ETH_DGID_CHECK=n        # default (y) silently drops genuinely-arriving UD packets on this ionic setup
+```text
+READ   ucp_get  -> rendezvous RTR -> peer RDMA WRITE -> local VRAM
+WRITE  ucp_put  -> RDMA WRITE -> remote VRAM
 ```
 
-Why each is needed:
-- `UCX_TLS`: our nosrq-patched `rc_verbs` (per-QP RQ, no SRQ) only
-  advertises `CONNECT_TO_EP`, not `CONNECT_TO_IFACE`. UCX's wireup logic
-  requires a `CONNECT_TO_IFACE`-capable auxiliary transport to bootstrap
-  any `CONNECT_TO_EP`-only lane. `tcp` alone does not satisfy that on this
-  cluster (`rc_verbs,tcp,self` fails wireup with `"no connect to iface"`);
-  `ud_verbs` does, so it must stay in `UCX_TLS`.
-- `UCX_NET_DEVICES`: pins to one rail so device selection is deterministic
-  on this multi-rail (8x ionic) system.
-- `UCX_IB_GID_INDEX`: wrong index causes connection failures independent of
-  the issues above; found via `ibv_devinfo`/`show_gids` (index 1 maps to
-  the RoCEv2 `::ffff:<fabric-ip>` GID on this cluster).
-- `UCX_UD_VERBS_ETH_DGID_CHECK=n`: the critical fix. With the default `y`,
-  UCX's `ud_verbs` transport validates the destination GID of each
-  incoming packet and silently drops it on mismatch on this ionic
-  RoCEv2/multi-rail setup — even though the exact same packets flow
-  perfectly over raw `ibv_ud_pingpong` between the same two nodes with the
-  same GID. The symptom without this fix: UD endpoints retransmit their
-  wireup/data packets forever with exponential backoff, eventually hitting
-  `ud_ep.c: Fatal: ... unhandled timeout error`. With `n`, UD (and
-  therefore the `rc_verbs` RMA it bootstraps) works immediately.
+## Build
 
-Raw `ucx_perftest tag_bw` cross-node confirms the fabric path itself is
-healthy at **44.45 GB/s, zero errors** (1 MiB messages) independent of
-nixlbench/NIXL.
+Two patches on UCX v1.22.0:
 
-## 2. Docker container launch flags
+| Patch | Why |
+|---|---|
+| `ucx_ionic_nosrq.patch.py` | ionic reports `max_srq: 0`. Stock `rc_verbs` refuses the device. Per-QP receive queues let RC register. |
+| `ucx_rocm_get_via_put.patch.py` | Drops GET bcopy, GET zcopy, and rendezvous GET when the local buffer is ROCm, so `ucp_get` uses the WRITE path above. |
 
 ```bash
-docker run --rm \
-  --device /dev/kfd --device /dev/dri \
-  --device /dev/infiniband/rdma_cm \
-  --device /dev/infiniband/uverbs0 `# repeat for each uverbsN present` \
-  --group-add video --group-add render --network host \
-  --ipc=host --ulimit memlock=-1:-1 --cap-add=IPC_LOCK \
-  --security-opt seccomp=unconfined \
-  -v /usr/lib/x86_64-linux-gnu/libionic.so.1:/usr/lib/x86_64-linux-gnu/libionic.so.1:ro \
-  -v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro \
-  -v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro \
-  -v "$HOST_PREFIX:/prefix:ro" \
-  -e UCX_TLS=rc_verbs,ud_verbs,tcp,self \
-  -e UCX_NET_DEVICES=ionic_0:1 -e UCX_IB_GID_INDEX=1 \
-  -e UCX_UD_VERBS_ETH_DGID_CHECK=n \
-  --entrypoint bash "$IMAGE" -lc '...'
+sbatch --export=ALL,NIXL_SRC=<existing NIXL prefix>,OUT=<new prefix> \
+  docs/scripts/build_ucx.sh
 ```
 
-Why each is needed:
-- `--device /dev/infiniband/rdma_cm` + `uverbs*`: containers need direct
-  access to the RDMA character devices to open verbs contexts at all.
-- `--ipc=host --ulimit memlock=-1:-1 --cap-add=IPC_LOCK`: RDMA memory
-  registration pins (locks) memory pages. Default container memlock limits
-  block this.
-- `--security-opt seccomp=unconfined`: some verbs/memory-pinning syscalls
-  are blocked by the default container seccomp profile.
-- The three `-v` bind-mounts: the container image does not ship the host's
-  NIC-specific verbs provider driver (`libionic*`). Without these,
-  `libibverbs` cannot find a usable device even with the character devices
-  present.
+`NIXL_SRC` supplies `nixlbench` and the NIXL plugin. The script replaces UCX in `OUT`. Confirm the process, not `PATH`:
 
-## 3. Working, verified scripts
+```text
+UCX  INFO  Version 1.22.0 (loaded from /prefix/lib/libucp.so.0)
+```
 
-The working scripts are checked in at `docs/scripts/` (and mirrored at
-`/data/avpaul/disagg_logs/nixlbench_vram/` for live runs):
+vLLM mounts the same prefix at `/nixl-prefix`.
 
-- `run_crossNode_ucx.sh` — cross-node driver, launched via `sbatch` across
-  2 real physical nodes. Derives the TARGET/INIT node pair from
-  `SLURM_JOB_NODELIST` so the same script runs against any node pair, not
-  just the two it was developed on. Verifies genuine peer pairing (exactly
-  one initiator + one target, neither side crashed mid-rendezvous) before
-  trusting any printed bandwidth number — nixlbench's own ASIO rendezvous
-  has no peer-identity verification, so this check is done externally.
-- `ucx_xnode_worker.sh` — per-node worker invoked by the driver. TARGET
-  resolves its own fabric IP and a free local port, then writes `IP:PORT`
-  to a shared NFS file for INIT to read (avoids value corruption seen when
-  passing that value as a bare positional argument through
-  `srun -> bash -> docker`). This is also where the UCX env vars (Section 1)
-  and Docker flags (Section 2) are applied.
-
-## 4. Known-good invocation (full 4KB→1GiB sweep, cross-node)
+## Settings used by both nixlbench runs
 
 ```bash
-sbatch --export=ALL,CHECK_CONSISTENCY=1 \
-  /data/avpaul/disagg_logs/nixlbench_vram/run_crossNode_ucx.sh
+export UCX_TLS=rc_verbs,ud_verbs,tcp,self,rocm
+export UCX_NET_DEVICES=ionic_0:1,lo
+export UCX_IB_GID_INDEX=1
+export UCX_UD_VERBS_ETH_DGID_CHECK=n
+export UCX_IB_GPU_DIRECT_RDMA=yes
+export UCX_RNDV_SCHEME=auto
+export UCX_RMA_PPLN_ENABLE=y
+export UCX_PROTO_EMULATION_ENABLE=n
 ```
 
-Defaults already in the script: `START_BLOCK_SIZE=4096`,
-`MAX_BLOCK_SIZE=1073741824` (1GiB), `NUM_ITER=64`, `WARMUP_ITER=16`,
-`INITIATOR_SEG_TYPE=DRAM`, `TARGET_SEG_TYPE=DRAM`,
-`UCX_TLS_OVERRIDE=rc_verbs,ud_verbs,tcp,self`. Override any of these via
-`--export=ALL,VAR=value,...` as needed.
+| Setting | Why it is set |
+|---|---|
+| `rc_verbs` | RC RMA. The data lane is `rma(rc_verbs/ionic_0:1)`. |
+| `ud_verbs` | RC bootstrap. The patched RC transport is connect-to-EP only and needs a connect-to-iface aux transport. Not the data path. |
+| `tcp`, `self` | Allowed, not selected. `self` is same-process. A run is RDMA only when no `inter-node` lane contains `tcp/`. |
+| `rocm` | Alias for `rocm_copy`, `rocm_ipc`, `rocm_gdr`. Without it UCX treats GPU pointers as host memory. |
+| `UCX_NET_DEVICES` | One rail. These NICs only reach the same rail index on the peer. |
+| `UCX_IB_GID_INDEX=1` | RoCEv2 GID on this fabric. |
+| `UCX_UD_VERBS_ETH_DGID_CHECK=n` | Default `y` drops ionic UD bootstrap packets. |
+| `UCX_IB_GPU_DIRECT_RDMA=yes` | Register the GPU buffer with the NIC. |
+| `UCX_RNDV_SCHEME=auto` | Does not select the GPU GET path. Left on auto so it does not force `get_zcopy`. |
+| `UCX_RMA_PPLN_ENABLE=y` | Turns on RMA rendezvous. Off by default here, and that is the only way the READ workaround is chosen. |
+| `UCX_PROTO_EMULATION_ENABLE=n` | Turns off software emulation under about 7 MiB. Left on, small READs pass the byte check at about 0.8 GB/s. |
 
-## 5. Scope notes
+`docs/scripts/ucx_xnode_worker.sh` passes these into the container, mounts `/boot` read-only (UCX reads the kernel config from there), and mounts the host ionic verbs provider. Both buffers are `hipMalloc` VRAM.
 
-- None of items 1–3 require any change to NIXL's own source code
-  (`git diff --stat` against upstream `main` shows zero changes under
-  `src/plugins/ucx/`) — the fix is entirely UCX env vars plus a
-  nosrq-SRQ-bypass UCX source patch (`ucx_ionic_nosrq.patch.py`, applied
-  when building the UCX prefix, unrelated to NIXL itself) and the benchmark
-  driver scripts above. This doc and the scripts are kept in our own fork
-  for internal reuse, not submitted upstream.
-- Sections 1–4 cover **WRITE** mode only. Section 6 explains why READ is
-  slow on this stack and what vLLM disaggregated serving uses instead.
+## nixlbench READ
 
-## 6. vLLM disaggregated serving
+**Command**
 
-Result: DeepSeek-V3 TP8 1P1D, VRAM→VRAM over `rc_verbs`, gsm8k 0.94,
-400/400 KV transfers OK.
+```bash
+sbatch -w "$NODE0,$NODE1" --export=ALL,OP_TYPE=READ \
+  docs/scripts/run_crossNode_ucx.sh
+```
 
-### READ vs WRITE (same UCX prefix, env and NIC rails in each pair)
+The worker runs:
 
-| Test | READ | WRITE |
-|---|---|---|
-| nixlbench, VRAM→VRAM, 4 MiB blocks, 1 rail | 0.84 GB/s | 27.8 GB/s |
-| vLLM TP8 KV transfer (~32 MB per rank per request) | ~50 ms, 0.64 GB/s per rank; stalls mid-eval | ~1.2 ms, ~30 GB/s per rank; eval completes |
+```bash
+nixlbench \
+  --runtime_type ASIO --asio_address "$TARGET_IP" --asio_port "$TARGET_PORT" \
+  --backend UCX \
+  --op_type READ \
+  --initiator_seg_type VRAM --target_seg_type VRAM \
+  --total_buffer_size 1073741824 \
+  --start_block_size 4096 --max_block_size 1073741824 \
+  --num_iter 16 --warmup_iter 4 \
+  --check_consistency 1
+```
 
-vLLM's `NixlConnector` (= `NixlPullConnector`) issues READ (`ucp_get_nbx`);
-`NixlPushConnector` issues WRITE (`ucp_put_nbx`).
+| Flag | Why, for READ |
+|---|---|
+| `--op_type READ` | Initiator pulls the target buffer into its own buffer. This is the GET that the patch rewrites. |
+| `--initiator_seg_type VRAM --target_seg_type VRAM` | Both ends are GPU memory. Host buffers hide the bug: RDMA READ into host DRAM works. |
+| `--check_consistency 1` | The failure mode is a successful completion with stale destination bytes. Bandwidth without this check is not a pass. |
+| `UCX_RMA_PPLN_ENABLE=y` | Required. This is what makes UCX pick rendezvous RTR (peer PUT) after the GET sink is refused. |
+| `UCX_PROTO_EMULATION_ENABLE=n` | Required for the curve below. The byte check still passes with emulation on; the rate does not. |
+| `rc_verbs` + `rocm` | The bytes move as an RDMA WRITE into the initiator GPU, not as a copy through host or TCP. |
 
-Root cause: NIXL defaults to `UCP_ERR_HANDLING_MODE_PEER`. UCX 1.18.1
-(`proto_multi.c`) then drops protocols without
-`UCP_PROTO_COMMON_INIT_FLAG_ERR_HANDLING`, which removes `get/zcopy` and
-`get/bcopy`. GET falls back to `get/am/bcopy` (emulated), whose AM sends
-exhaust the nosrq RQ and cause RNR retries. PUT protocols carry the flag, so
-WRITE stays `put/offload/zcopy`. `ucx_error_handling_mode=none` restores
- fast GET but failed the data check, so don't use it.
+`UCX_PROTO_INFO=y` on a READ run prints the selected protocol. The line that matches this recipe is `rendezvous data send from rocm/GPU0 to rocm/dev[0]` on `rc_verbs`.
 
-### Settings (on top of Sections 1–2)
+## nixlbench WRITE
+
+**Command**
+
+```bash
+sbatch -w "$NODE0,$NODE1" --export=ALL,OP_TYPE=WRITE \
+  docs/scripts/run_crossNode_ucx.sh
+```
+
+Same `nixlbench` invocation with `--op_type WRITE`. The initiator's VRAM is RDMA-written into the target's VRAM. The GET patch is not on this path.
+
+| Flag | Why, for WRITE |
+|---|---|
+| `--op_type WRITE` | `ucp_put` over `rc_verbs`. This is the operation the NIC already performs correctly into VRAM. |
+| VRAM on both sides | Same placement as READ, so the two curves differ by direction only. |
+| `--check_consistency 1` | Same byte check. |
+| `UCX_RMA_PPLN_ENABLE=y` | Not required for WRITE. Kept so READ and WRITE are one binary and one environment. |
+| `UCX_PROTO_EMULATION_ENABLE=n` | Same. WRITE does not fall into the slow GET emulation path, and the flag stays so the comparison is honest. |
+
+## Bandwidth
+
+Two nodes, one `ionic_0` rail, VRAM to VRAM, consistency checked, UCX 1.22.0.
+
+![nixlbench READ and WRITE bandwidth](figures/ucx_ionic_nixlbench_read_write.svg)
+
+| Size | READ GB/s | WRITE GB/s |
+|---:|---:|---:|
+| 4 KiB | 0.215 | 0.379 |
+| 8 KiB | 0.406 | 0.753 |
+| 16 KiB | 0.851 | 1.266 |
+| 32 KiB | 1.765 | 2.497 |
+| 64 KiB | 3.246 | 4.810 |
+| 128 KiB | 6.298 | 9.279 |
+| 256 KiB | 10.782 | 15.534 |
+| 512 KiB | 17.513 | 23.831 |
+| 1 MiB | 25.575 | 31.477 |
+| 2 MiB | 20.764 | 36.158 |
+| 4 MiB | 30.394 | 42.799 |
+| 8 MiB | 37.787 | 45.100 |
+| 16 MiB | 45.222 | 47.260 |
+| 32 MiB | 45.283 | 48.072 |
+| 64 MiB | 47.764 | 48.419 |
+| 128 MiB | 47.969 | 48.683 |
+| 256 MiB | 48.524 | 48.798 |
+| 512 MiB | 46.983 | 46.921 |
+| 1 GiB | 47.119 | 46.929 |
+
+WRITE is ahead until 16 MiB. Both sit near 48 GB/s from 64 MiB up. The READ dip at 2 MiB is in the measured sweep; that point passed the byte check. Rebuild the figure with:
+
+```bash
+python3 docs/scripts/plot_nixlbench_bw.py \
+  docs/scripts/logs/read_<job>.bw docs/scripts/logs/write_<job>.bw \
+  docs/figures/ucx_ionic_nixlbench_read_write.svg
+```
+
+## Disagg
+
+`kv_role` does not select the direction. The connector does. Prefill is `kv_producer`, decode is `kv_consumer`, on both modes.
+
+| Mode | `kv_connector` | Runtime | Wire |
+|---|---|---|---|
+| READ | `NixlConnector` | `NixlPullConnector` | Decode pulls. UCX GET is served by the peer RDMA WRITE. |
+| WRITE | `NixlPushConnector` | `NixlPushConnector` | Prefill RDMA-writes KV into decode VRAM. |
+
+`kv_buffer_device` stays `cuda`. On this ROCm build that is the GPU allocation. `backends` is `UCX` only.
+
+Same process environment as nixlbench, plus:
+
+```bash
+export UCX_MODULE_DIR=/nixl-prefix/lib/ucx
+export UCX_LOG_LEVEL=info
+export VLLM_NIXL_SIDE_CHANNEL_HOST="$HOST_IP"
+export VLLM_NIXL_SIDE_CHANNEL_PORT=5600
+```
+
+`UCX_MODULE_DIR` is required because the container mounts the prefix at `/nixl-prefix`, not UCX's compiled-in `/prefix`.
+
+### TP8 READ
+
+```bash
+vllm serve "$MODEL" \
+  --host "$PREFILL_IP" --port 8100 \
+  --tensor-parallel-size 8 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.85 \
+  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_buffer_device":"cuda","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"backends":["UCX"],"kv_lease_duration":180}}'
+```
+
+Decode is the same command with `--host "$DECODE_IP" --port 8200` and `"kv_role":"kv_consumer"`.
+
+### TP8 WRITE
+
+Same two commands. The only change is `"kv_connector":"NixlPushConnector"` on both processes. Do not swap producer and consumer.
+
+Each TP rank sets `UCX_NET_DEVICES=ionic_<rank>:1,lo` before the UCX backend is created (`NIXL_UCX_PER_RANK_RAIL=1`). Rank *k* only has a path to rank *k* on the other node.
+
+### EP8
+
+Same connector JSON as the matching TP8 mode. Parallelism replaces TP:
+
+```bash
+vllm serve "$MODEL" \
+  --host "$PREFILL_IP" --port 8100 \
+  -tp 1 \
+  --data-parallel-size 8 --data-parallel-size-local 8 \
+  --data-parallel-address "$PREFILL_IP" --data-parallel-rpc-port 13345 \
+  --enable-expert-parallel \
+  --all2all-backend mori_high_throughput \
+  --no-enable-prefix-caching \
+  --api-server-count 8 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.75 \
+  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_buffer_device":"cuda","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"backends":["UCX"],"kv_lease_duration":180}}'
+```
+
+Decode uses `--all2all-backend mori_low_latency`, its own `--data-parallel-address`, and `"kv_role":"kv_consumer"`. WRITE again only replaces `NixlConnector` with `NixlPushConnector`.
+
+Two EP8-only settings:
 
 | Setting | Why |
 |---|---|
-| `kv_connector=NixlPushConnector`, `kv_buffer_device=cuda` | Uses RDMA WRITE; KV stays in VRAM |
-| `UCX_NET_DEVICES=ionic_<gpu>:1,lo` per rank (set in `nixl_agent.__init__` from `torch.cuda.current_device()`) | GPU k ↔ `ionic_k` share a PCIe switch; rails are isolated |
-| `UCX_TLS=rc_verbs,ud_verbs,tcp,self,rocm_copy` | Without `rocm_copy`, VRAM is registered as host memory |
-| `UCX_IB_GPU_DIRECT_RDMA=yes`, `UCX_RNDV_SCHEME=get_zcopy` | GPU-direct, no host bounce |
-| Mount prefix at `/nixl-prefix` and `/prefix`; `LD_LIBRARY_PATH=/nixl-prefix/lib:/nixl-prefix/lib/ucx`, `UCX_MODULE_DIR=/nixl-prefix/lib/ucx` | Otherwise the image's bundled UCX 1.22 loads (no `rc_verbs` on ionic) |
-| `PYTHONPATH=/nixlpy` | Bindings ABI-matched to the mounted `libnixl` |
+| `UCX_NET_DEVICES=ionic_0:1,lo` and `NIXL_UCX_PER_RANK_RAIL=0` | A request's prefill DP rank and decode DP rank do not match. Rails are isolated, so every rank stays on `ionic_0`, the one rail that reaches every peer rank. |
+| `UCX_KEEPALIVE_INTERVAL=inf` | Eight ranks sharing one UD receive queue overflow it. UD stays for RC wireup. A dead peer shows up as a failed RDMA op. |
 
-### Commands
+### Router
 
-Image `vllm/vllm-openai-rocm:nightly` (vLLM 0.32.0rc1.dev100+g77154ca61),
-router image `vllm/vllm-router:nightly`. Placeholders:
-
-- `NIXL_PREFIX`: NIXL + UCX 1.18.1 install built with the nosrq patch
-- `NIXL_PY`: NIXL Python bindings built against it, with the per-rank rail
-  hook in `nixl_agent.__init__` (sets `UCX_NET_DEVICES=ionic_<gpu>:1,lo`)
-- `P_IP` / `D_IP`: prefill / decode node IPs; `MODELS`: model directory
-
-**1. Container (prefill node; on the decode node use `NODE_IP=$D_IP`)**
+NIXL workers are not discovered through the router. Pass the servers:
 
 ```bash
-export NIXL_PREFIX=/path/to/nixl-prefix-nosrq
-export NIXL_PY=/path/to/nixl-python-rail
-export MODELS=/data/models2
-export NODE_IP=$P_IP
-
-docker run --rm -it \
-  --device /dev/dri --device /dev/kfd --device /dev/infiniband \
-  --network host --ipc host \
-  --group-add "$(getent group video | cut -d: -f3)" \
-  --group-add "$(getent group render | cut -d: -f3)" \
-  --cap-add SYS_PTRACE --cap-add IPC_LOCK \
-  --security-opt seccomp=unconfined \
-  --shm-size 64G \
-  --ulimit nofile=1048576:1048576 --ulimit memlock=-1:-1 \
-  -v "$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1)":/usr/lib/x86_64-linux-gnu/libionic.so.1:ro \
-  -v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro \
-  -v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro \
-  -v "$NIXL_PREFIX":/nixl-prefix:ro \
-  -v "$NIXL_PREFIX":/prefix:ro \
-  -v "$NIXL_PY":/nixlpy:ro \
-  -v "$MODELS":/models:ro \
-  -e UCX_TLS=rc_verbs,ud_verbs,tcp,self,rocm_copy \
-  -e UCX_NET_DEVICES=ionic_0:1,lo \
-  -e UCX_IB_GID_INDEX=1 \
-  -e UCX_UD_VERBS_ETH_DGID_CHECK=n \
-  -e UCX_IB_GPU_DIRECT_RDMA=yes \
-  -e UCX_RNDV_SCHEME=get_zcopy \
-  -e UCX_MODULE_DIR=/nixl-prefix/lib/ucx \
-  -e UCX_RCACHE_MAX_UNRELEASED=1024 \
-  -e UCX_ROCM_COPY_SIGPOOL_MAX_ELEMS=inf \
-  -e UCX_WARN_UNUSED_ENV_VARS=n \
-  -e UCX_LOG_LEVEL=info \
-  -e PYTHONPATH=/nixlpy \
-  -e LD_LIBRARY_PATH=/nixl-prefix/lib/x86_64-linux-gnu:/nixl-prefix/lib:/nixl-prefix/lib/ucx \
-  -e VLLM_NIXL_SIDE_CHANNEL_HOST="$NODE_IP" \
-  -e VLLM_NIXL_SIDE_CHANNEL_PORT=5600 \
-  vllm/vllm-openai-rocm:nightly bash
+vllm-router \
+  --vllm-pd-disaggregation --kv-connector nixl \
+  --prefill "http://$PREFILL_IP:8100" \
+  --decode "http://$DECODE_IP:8200" \
+  --host 0.0.0.0 --port 30000 \
+  --policy round_robin --prefill-policy round_robin --decode-policy round_robin
 ```
 
-`UCX_NET_DEVICES=ionic_0:1,lo` is only the fallback; each rank overrides it
-with its own rail. `VLLM_NIXL_SIDE_CHANNEL_HOST` must be the node's own IP
-(the default is localhost, which breaks cross-node handshakes).
+### Results
 
-**2. Prefill server (inside the prefill container)**
+UCX 1.22.0, GPU KV, inter-node lane `rc_verbs` only.
+
+| Topology | Mode | GSM8K exact_match | Steady KV rate |
+|---|---|---:|---|
+| TP8 1P1D | READ | 0.92 | 19–35 GB/s, about 31 GB/s late in the run |
+| TP8 1P1D | WRITE | 0.98 | 24–34 GB/s |
+| EP8 1P1D | READ | 0.94 | not aggregated (8 API servers); lane is `rc_verbs/ionic_0` |
+| EP8 1P1D | WRITE | 0.94 | same |
+
+TP8 rates are per transfer (about 24–36 MB, 61 descriptors), after the first sample. Failed transfers: 0. The rate is below the nixlbench plateau because a KV transfer is many small descriptors, not one 64 MiB message.
+
+## Check the data path
+
+`UCX_TLS` is the allow-list. The lane is the selection.
 
 ```bash
-vllm serve /models/DeepSeek-V3 \
-  --host "$P_IP" --port 8100 \
-  --tensor-parallel-size 8 \
-  --trust-remote-code \
-  --kv-cache-dtype fp8 \
-  --max-model-len 32768 \
-  --gpu-memory-utilization 0.85 \
-  --kv-transfer-config '{"kv_connector":"NixlPushConnector","kv_role":"kv_producer","kv_buffer_device":"cuda","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"backends":["UCX"],"kv_lease_duration":180}}'
+grep -h 'UCX  INFO  Version' prefill*.log decode*.log | sort -u
+grep -h 'inter-node cfg' prefill*.log decode*.log | grep -oE 'rma\([^)]*\)|tcp/' | sort -u
+grep -h 'Creating v1 connector' prefill*.log decode*.log
+grep -hE 'Num failed transfers=[1-9]|NIXL_ERR' prefill*.log decode*.log
 ```
 
-**3. Decode server (inside the decode container)**
+Pass looks like `Version 1.22.0`, `rma(rc_verbs/ionic_N:1)`, `NixlPullConnector` or `NixlPushConnector`, and no `tcp/` or `NIXL_ERR` lines.
 
-```bash
-vllm serve /models/DeepSeek-V3 \
-  --host "$D_IP" --port 8200 \
-  --tensor-parallel-size 8 \
-  --trust-remote-code \
-  --kv-cache-dtype fp8 \
-  --max-model-len 32768 \
-  --gpu-memory-utilization 0.85 \
-  --kv-transfer-config '{"kv_connector":"NixlPushConnector","kv_role":"kv_consumer","kv_buffer_device":"cuda","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"backends":["UCX"],"kv_lease_duration":180}}'
-```
-
-**4. Router (prefill node, after both servers report healthy)**
-
-```bash
-docker run -d --name vllm-router --network host \
-  vllm/vllm-router:nightly \
-  vllm-router --vllm-pd-disaggregation --kv-connector nixl \
-    --prefill "http://$P_IP:8100" \
-    --decode "http://$D_IP:8200" \
-    --worker-startup-timeout-secs 1800 \
-    --host 0.0.0.0 --port 30000 \
-    --intra-node-data-parallel-size 1 \
-    --policy round_robin --prefill-policy round_robin --decode-policy round_robin \
-    --log-level info
-```
-
-**5. Accuracy check (any node)**
-
-```bash
-lm_eval --model local-completions --tasks gsm8k --num_fewshot 5 --limit 50 \
-  --model_args "model=/models/DeepSeek-V3,base_url=http://$P_IP:30000/v1/completions,num_concurrent=1,max_retries=3,tokenized_requests=False,timeout=7200" \
-  --gen_kwargs max_gen_toks=512
-```
-
-Router flags: static `--prefill/--decode` URLs, because NIXL workers do not
-register through router discovery. `kv_lease_duration=180` keeps prefill from
-releasing (and tearing down the endpoint for) blocks that decode has not
-fetched yet at `num_concurrent=1`; the 30 s default triggers the
-`ud_ep.c:285` abort below. `kv_load_failure_policy=recompute` retries a failed
-load instead of failing the request.
-
-Known issue: the `ud_verbs` keepalive can still abort at `ud_ep.c:285`
-(assertions are compiled in).
+The READ patch does not make hardware RDMA READ into VRAM work. It stops UCX from using that operation.
